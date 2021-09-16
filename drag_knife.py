@@ -70,52 +70,54 @@ def gxy(command, origin, destination, **extras):
     assert "center" in extras if command in CIRCULAR else True
     xo, yo = origin
     xd, yd = destination
-    AXIS = ( "X{:.2f}", "Y{:.2f}" )
     if origin != destination:    #outputs only if we have a move
         yield command
         if xo != xd:
-            yield "X{:.2f}".format(xd)
+            yield "X{:.4g}".format(xd)
         if yo != yd:
-            yield "Y{:.2f}".format(yd)
+            yield "Y{:.4g}".format(yd)
         if command in CIRCULAR:
             xc, yc = extras["center"]
-            yield "I{:.2f}J{:.2f}".format(xc - xo, yc - yo)
+            yield "I{:.4g}J{:.4g}".format(xc - xo, yc - yo)
         yield "\n"
 
 def gz(z):
-    yield "G0Z{:.2f}".format(z)
+    yield "G0Z{:.4g}".format(z)
     yield "\n"
 
-def preprocess(line):
+def preprocess(block):
     # remove EOL (to ensure consistency in final output) and ignore comments
-    COMMENT = re.compile(r"(\s*);\s*")
-    raw = line.rstrip()
-    found = COMMENT.search(raw)
+    block = block.rstrip()
+    found = preprocess.__COMMENT.search(block)
     if found and found.group(1):
-        return (raw, found.group(1))
+        return (block, found.group(1))
     else:
-        return (raw, raw)
+        return (block, block)
+preprocess.__COMMENT = re.compile(r"(\s*);\s*")
 
 class motion():
-    def __init__(self, radius, retract, sharp_angle, filter = None):
+    def __init__(self, radius, retract, safe_retract, sharp_angle, select = None):
         assert 0 <= sharp_angle <= 90
         self.coordinates = [(0.0, 0.0)]
         self.z = 0.0
         self.skipping = False
         self.radius = radius
         self.retract = retract
+        self.safe_retract = safe_retract
         self.angle_min = sharp_angle
         self.angle_max = 180 - sharp_angle
         self.CRITICAL_PARAMETER = re.compile(r"[SF][\d\.\-]+")
-        self.LINE = 99
-        if filter:
-            self.__call__ = filter(self.__process)
+        self.BLOCK = 99
+        if select:
+            self.__call__ = lambda *args: filter(select, self.__process(*args))
         else:
             self.__call__ = self.__process
 
     def __sharp_angle(self):
         assert len(self.coordinates) > 2
-        return self.angle_max > angle(self.coordinates[-3], self.coordinates[-2], self.coordinates[-1]) > self.angle_min
+        return self.angle_max > angle(self.coordinates[-3],
+                                      self.coordinates[-2],
+                                      self.coordinates[-1]) > self.angle_min
 
     def __process(self, speed, code):
         xp, yp = self.coordinates[-1]
@@ -123,14 +125,14 @@ class motion():
         self.z = pos_z(code, self.z)
         if self.coordinates[-2] == self.coordinates[-1]:
             self.coordinates.pop(0)
-            yield self.LINE
+            yield self.BLOCK
         elif speed == 0:
             while len(self.coordinates) > 1:
                 self.coordinates.pop(0)
             self.skipping = False
             logging.debug("raising blade: %s", code)
-            for op in itertools.chain(gz(self.z + self.retract),
-                                      itertools.repeat(self.LINE, 1),
+            for op in itertools.chain(gz(self.z + self.safe_retract),
+                                      itertools.repeat(self.BLOCK, 1),
                                       gz(self.z)):
                 yield op
         elif speed == 1:
@@ -152,7 +154,7 @@ class motion():
                                      self.coordinates[-1])
                     logging.debug("rotating blade: %s", code)
                     for op in itertools.chain(gxy("G1", self.coordinates[-2], travel),
-                                              gz(self.z + self.radius),
+                                              gz(self.z + self.retract),
                                               gxy(turn, travel, swivel,
                                                   center=self.coordinates[-2]),
                                               gz(self.z)):
@@ -161,31 +163,39 @@ class motion():
                 self.coordinates.pop()
                 if self.CRITICAL_PARAMETER.search(code):
                     # detect a shortcoming of the current implementation
-                    logging.critical("skipping feedrate or speed: %s", code)
+                    logging.error("skipping feedrate or speed: %s", code)
                 else:
                     logging.debug("skipping: %s", code)
             else:
-                yield self.LINE
+                yield self.BLOCK
             while len(self.coordinates) > 3:
                 self.coordinates.pop(0)
         else:
             logging.error("unexpected motion code %i", speed)
-            yield self.LINE
+            yield self.BLOCK
 
-def never_raise_blade(iter):
-    def result(*args):
-        for op in iter(*args):
-            if not isinstance(op, basestring) or not op.startswith("G0Z"):
-                yield op
-    return result
+def never_raise_blade(op):
+    return not isinstance(op, basestring) or not op.startswith("G0Z")
+
+def length_tuple(value, unit):
+    if unit == 1:
+        return (value / 25.4, value)
+    else:
+        return (value, value * 25.4)
 
 def cli():
-    RADIUS = {
-        "D1": (1.6, 1.6),
-        "D2": (3.1, 6.3),
-        "D3": (1.6, 1.6),
-        "D4": (3.1, 6.3)
-    }
+    # 1" = 25.4mm
+    MAX_THICKNESS = (
+        (0.0625, 1.6),
+        (0.25, 6.3)
+    )
+    MIN_RADIUS = (
+        (0.0625, 1.6),
+        (0.125, 3.1)
+    )
+    SAFE_RETRACT = (0.2, 5)
+    KNIFE_ID = { "D1": 0, "D2": 1, "D3": 0, "D4": 1 }
+    UNIT = { "mm": 1, "in": 0 }
     LOG_LEVEL = {
         "critical": logging.CRITICAL,
         "error": logging.ERROR,
@@ -196,8 +206,8 @@ def cli():
     args_parser = argparse.ArgumentParser()
     args_parser.add_argument("input", help = "input file")
     args_parser.add_argument("-o", "--output", help = "output file")
-    args_parser.add_argument("-t", "--thickness", required=True, type=float,
-                             help="material thickness (mm)")
+    args_parser.add_argument("-t", "--thickness", required=True,
+                             help="material thickness, ex.: 5mm or 0.2in")
     args_parser.add_argument("-k", "--knife", choices=["D1", "D2", "D3", "D4"],
                              help="drag knife model", default="D4")
     args_parser.add_argument("-a", "--angle", type=int, default = 20,
@@ -212,44 +222,60 @@ def cli():
         path, basename = os.path.split(args.input)
         parts = basename.split(".")
         parts[-2 if len(parts) > 1 else -1] += "_knife"
-        foutput = path + ".".join(parts)
+        foutput = os.path.join(path, ".".join(parts))
     else:
         foutput = args.output
     logging.info("%s -> %s", args.input, foutput)
-    min_radius, max_thickness = RADIUS[args.knife]
-    if args.thickness > max_thickness:
-        logging.warning("%f is too thick for knife", args.thickness)
-    if args.thickness > min_radius:
-        radius = args.thickness
+    knife = KNIFE_ID[args.knife]
+    t_match = re.match(r"^([0-9\.]+)(mm|in)?$", args.thickness)
+    if t_match == None:
+        logging.critical("invalid thickness, needs value and unit such as 5mm or 0.2in")
+        sys.exit(2)
+    thickness = float(t_match.group(1))
+    if t_match.group(2):
+        unit = UNIT[t_match.group(2)]
     else:
-        radius = min_radius
+        unit = UNIT["mm"]
+    if thickness > MAX_THICKNESS[knife][unit]:
+        logging.warning("%f is too thick for knife %s", thickness, args.knife)
+    if thickness > MIN_RADIUS[knife][unit]:
+        radius = length_tuple(thickness, unit)
+    else:
+        radius = MIN_RADIUS[knife]
     if not 10 <= args.angle <= 90:
-        logging.error("angle must be between 10 and 90 degrees")
+        logging.critical("angle must be between 10 and 90 degrees")
         sys.exit(2)
     if args.nr:
         logging.warning("will not raise the blade (for debugging paths)")
-        filter = never_raise_blade
+        select = never_raise_blade
     else:
-        filter = None
-    return (args.input, foutput, radius, args.thickness + 10.0, args.angle, filter)
+        select = None
+    return (args.input, foutput,
+            radius, length_tuple(thickness * 0.9, unit),
+            length_tuple(thickness + SAFE_RETRACT[unit], unit), args.angle, select)
 
-def run(finput, foutput, radius, retract, angle, filter):
+def run(finput, foutput, radius, retract, safe_retract, angle, select):
     MOVE = re.compile(r"G0?([0123])")
-    postprocess = motion(radius, retract, angle, filter)
-    for line in nc:
-        raw, code = preprocess(line)
-        move = MOVE.search(code)
+    UNIT = re.compile(r"G2([01])")
+    postprocess = motion(radius[1], retract[1], safe_retract[1], angle, select)
+    for block in nc:
+        raw, code = preprocess(block)
         adapted = (raw, "\n")
+        unit = UNIT.search(code)
+        if unit:
+            u = int(unit.group(1))
+            postprocess = motion(radius[u], retract[u], safe_retract[u], angle, select)
+        move = MOVE.search(code)
         if move:
             adapted = postprocess(int(move.group(1)), code)
         for op in adapted:
-            if op == postprocess.LINE:
+            if op == postprocess.BLOCK:
                 out.write(raw)
                 out.write("\n")
             elif isinstance(op, basestring):
                 out.write(op)
 
 if __name__ == "__main__":
-    finput, foutput, radius, retract, sharp_angle, filter = cli()
+    finput, foutput, radius, retract, safe_retract, sharp_angle, select = cli()
     with open(finput, "r") as nc, open(foutput, "w") as out:
-        run(nc, out, radius, retract, sharp_angle, filter)
+        run(nc, out, radius, retract, safe_retract, sharp_angle, select)
