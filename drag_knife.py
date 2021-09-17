@@ -137,7 +137,8 @@ class motion():
                 yield op
         elif speed == 1:
             length = distance(self.coordinates[-2], self.coordinates[-1])
-            self.skipping = not self.skipping and length <= self.radius
+            self.skipping = not self.skipping and length <= self.radius and \
+                            len(self.coordinates) > 2
             if not self.skipping and len(self.coordinates) > 2 and self.__sharp_angle():
                 if length < self.radius:
                     # the knife cannot do short turns; if there's a sharp turn with too
