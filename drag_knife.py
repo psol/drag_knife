@@ -172,7 +172,7 @@ class motion():
             while len(self.coordinates) > 3:
                 self.coordinates.pop(0)
         else:
-            logging.error("unexpected motion code %i", speed)
+            logging.error("unexpected motion code G%i", speed)
             yield self.BLOCK
 
 def never_raise_blade(op):
@@ -204,11 +204,13 @@ def cli():
         "info": logging.INFO,
         "debug": logging.DEBUG
     }
+    LENGTH = re.compile(r"^([0-9\.]+)(mm|in)?$")
     args_parser = argparse.ArgumentParser()
     args_parser.add_argument("input", help = "input file")
     args_parser.add_argument("-o", "--output", help = "output file")
     args_parser.add_argument("-t", "--thickness", required=True,
                              help="material thickness, ex.: 5mm or 0.2in")
+    args_parser.add_argument("-r", "--retract", help="retract height when turning")
     args_parser.add_argument("-k", "--knife", choices=["D1", "D2", "D3", "D4"],
                              help="drag knife model", default="D4")
     args_parser.add_argument("-a", "--angle", type=int, default = 20,
@@ -228,21 +230,37 @@ def cli():
         foutput = args.output
     logging.info("%s -> %s", args.input, foutput)
     knife = KNIFE_ID[args.knife]
-    t_match = re.match(r"^([0-9\.]+)(mm|in)?$", args.thickness)
+    t_match = LENGTH.match(args.thickness)
     if t_match == None:
         logging.critical("invalid thickness, needs value and unit such as 5mm or 0.2in")
         sys.exit(2)
     thickness = float(t_match.group(1))
     if t_match.group(2):
         unit = UNIT[t_match.group(2)]
+        unit_name = t_match.group(2)
     else:
         unit = UNIT["mm"]
+        unit_name = "mm"
     if thickness > MAX_THICKNESS[knife][unit]:
-        logging.warning("%f is too thick for knife %s", thickness, args.knife)
+        logging.warning("%g%s is too thick for knife %s",
+                        thickness, unit_name, args.knife)
     if thickness > MIN_RADIUS[knife][unit]:
         radius = length_tuple(thickness, unit)
     else:
         radius = MIN_RADIUS[knife]
+    retract = length_tuple(thickness * 0.9, unit)
+    if args.retract != None:
+        r_match = LENGTH.match(args.retract)
+        if r_match != None:
+            r_unit = unit
+            if r_match.group(2):
+                r_unit = UNIT[r_match.group(2)]
+            retract = length_tuple(float(r_match.group(1)), r_unit)
+            if retract[unit] > thickness:
+                logging.warning("%g%s retract while turning is more than %g%s thickness",
+                                retract[unit], unit_name, thickness, unit_name)
+        else:
+            logging.critical("invalid retract, needs value and optionally unit")
     if not 10 <= args.angle <= 90:
         logging.critical("angle must be between 10 and 90 degrees")
         sys.exit(2)
@@ -252,7 +270,7 @@ def cli():
     else:
         select = None
     return (args.input, foutput,
-            radius, length_tuple(thickness * 0.9, unit),
+            radius, retract,
             length_tuple(thickness + SAFE_RETRACT[unit], unit), args.angle, select)
 
 def run(finput, foutput, radius, retract, safe_retract, angle, select):
